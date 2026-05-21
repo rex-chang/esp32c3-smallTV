@@ -4,11 +4,28 @@
 
 ---
 
-## 一、 项目基本信息
-- **软件原作**：Misaka
-- **软件修改**：微车游（项目版本 `SDD V1.4`）
-- **核心芯片**：ESP32-C3 (RISC-V 架构)
-- **屏幕型号**：金逸晨 1.54寸 TFT LCD (ST7789 驱动，240x240 分辨率)
+## 一、 开发环境搭建与初始化 (Environment Setup)
+为了在另外一台电脑上快速初始化编译环境，请确保系统已安装 [arduino-cli](https://arduino.github.io/arduino-cli/)。
+
+### 1. 手动步骤
+在一台新电脑上，依次执行以下命令：
+```bash
+# 1. 配置 ESP32 开发板源地址 (如已配置可跳过)
+arduino-cli config set board_manager.additional_urls https://raw.githubusercontent.com/espressif/arduino-esp32/gh-pages/package_esp32_index.json
+
+# 2. 更新开发板索引
+arduino-cli core update-index
+
+# 3. 安装指定版本 2.0.17 的 ESP32 核心包 (必须对齐版本，防止新版本 API 兼容问题)
+arduino-cli core install esp32:esp32@2.0.17
+```
+
+### 2. 一键脚本初始化
+项目根目录下提供了一键初始化脚本 `init_env.sh`。在新电脑上只需运行：
+```bash
+chmod +x init_env.sh
+./init_env.sh
+```
 
 ---
 
@@ -29,8 +46,6 @@
 ---
 
 ## 三、 编译与烧录指南
-项目采用 `arduino-cli` 工具链在 macOS 环境下完成编译与烧录：
-
 - **开发板 FQBN**：`esp32:esp32:esp32c3`
 - **分区配置**：需指定 `PartitionScheme=huge_app`（本程序固件较大，超过默认 1.2MB 限制）
 - **编译烧录一体化命令**：
