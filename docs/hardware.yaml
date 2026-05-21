@@ -1,0 +1,17 @@
+pins:
+  GND: GND
+  VCC: 3.3V
+  SCL: 3   # SPI SCLK
+  SDA: 5   # SPI MOSI
+  DC: 2    # Data/Command
+  RES: 6   # Reset
+  BLK: 1   # Backlight
+  CS: -1   # Not used
+screen:
+  model: "JHD1283A"   # ST7789 240x240
+  width: 240
+  height: 240
+mcu:
+  name: "ESP32-C3"
+  architecture: "RISC-V"
+  core: "esp32:esp32:esp32c3"
