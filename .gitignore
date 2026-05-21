@@ -8,3 +8,12 @@ build_out/
 *.bin
 *.elf
 *.map
+
+# 忽略 Python 缓存和临时文件
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+.venv/
+venv/
