@@ -159,10 +159,19 @@ int DHT_img_flag = 0;   //DHT传感器使用标志位
 uint8_t DISP_mode = 0;     //显示模式 0=天气, 1=Token Plan
 uint8_t Token_en = 0;      //0=无数据, 1=有数据已显示, 2=新数据待刷新
 int prevTokenMinute = -1;  //Token模式时钟分钟记录
+int tokenPageIndex = 0;    //Token模式当前页
+unsigned long prevTokenPageMillis = 0;
+unsigned long prevTokenTitleMillis = 0;
+int tokenTitleOffset = 0;
 String Token_JSON = "{}";   //存储原始JSON
 unsigned long Token_update_time = 0;
 
 #define MAX_SERVICES 5
+#define TOKEN_PAGE_SIZE 3
+#define TOKEN_PAGE_INTERVAL_MS 8000
+#define TOKEN_TITLE_SCROLL_MS 220
+#define TOKEN_TITLE_VIEW_W 154
+#define TOKEN_TITLE_GAP 24
 struct TokenService {
   String name;
   long used;
@@ -236,6 +245,9 @@ void readCityCodefromEEP(int * citycode);
 void handleTokenPost();
 void displayToken();
 void displayTokenHeader();
+void displayTokenBody();
+void displayTokenBodySlide();
+void drawTokenBodyPage(int pageIndex, bool dim);
 #endif
 
 /* *****************************************************************
@@ -648,6 +660,8 @@ void handleTokenPost()
     }
 
     Token_en = 2;
+    tokenPageIndex = 0;
+    prevTokenPageMillis = millis();
     Token_update_time = now();
     Token_JSON = body;
 
@@ -1239,12 +1253,22 @@ void LCD_reflash(int en)
     {
       if (en == 1) tft.fillScreen(0x0000);
       prevTokenMinute = minute();
+      prevTokenPageMillis = millis();
+      prevTokenTitleMillis = millis();
       if (Token_en == 2) Token_en = 1;
       displayToken();
     }
-    else if (minute() != prevTokenMinute)
+    else if (tokenServiceCount > TOKEN_PAGE_SIZE && millis() - prevTokenPageMillis >= TOKEN_PAGE_INTERVAL_MS)
+    {
+      int pageCount = (tokenServiceCount + TOKEN_PAGE_SIZE - 1) / TOKEN_PAGE_SIZE;
+      tokenPageIndex = (tokenPageIndex + 1) % pageCount;
+      prevTokenPageMillis = millis();
+      displayTokenBodySlide();
+    }
+    else if (minute() != prevTokenMinute || millis() - prevTokenTitleMillis >= TOKEN_TITLE_SCROLL_MS)
     {
       prevTokenMinute = minute();
+      prevTokenTitleMillis = millis();
       displayTokenHeader();
     }
     return;
@@ -1632,60 +1656,88 @@ void removeLastUtf8Char(String &text)
 String fitTokenText(String text, int maxWidth)
 {
   if (clk.textWidth(text) <= maxWidth) return text;
-  while (text.length() > 0 && clk.textWidth(text + "~") > maxWidth) {
+  while (text.length() > 0 && clk.textWidth(text) > maxWidth) {
     removeLastUtf8Char(text);
   }
-  return text + "~";
+  return text;
 }
 
 void displayTokenHeader()
 {
   clk.setColorDepth(8);
   clk.loadFont(ZdyLwFont_20);
-  clk.createSprite(240, 30);
+
+  clk.createSprite(TOKEN_TITLE_VIEW_W, 30);
   clk.fillSprite(bgColor);
   clk.setTextDatum(TL_DATUM);
   clk.setTextColor(TFT_GREEN, bgColor);
-  clk.drawString("TOKEN PLAN", 4, 4);
+  String title = "USAGE LIMITS";
+  int titleW = clk.textWidth(title);
+  int drawX = 0;
+  if (titleW > TOKEN_TITLE_VIEW_W) {
+    drawX = -tokenTitleOffset;
+    clk.drawString(title, drawX, 4);
+    clk.drawString(title, drawX + titleW + TOKEN_TITLE_GAP, 4);
+    tokenTitleOffset += 3;
+    if (tokenTitleOffset > titleW + TOKEN_TITLE_GAP) tokenTitleOffset = 0;
+  } else {
+    tokenTitleOffset = 0;
+    clk.drawString(title, 0, 4);
+  }
+  clk.pushSprite(4, 0);
+  clk.deleteSprite();
+
+  clk.createSprite(78, 30);
+  clk.fillSprite(bgColor);
   String t = String(hour()<10?"0":"")+String(hour())+":"+
              String(minute()<10?"0":"")+String(minute());
   clk.setTextDatum(TR_DATUM);
   clk.setTextColor(TFT_WHITE, bgColor);
-  clk.drawString(t, 236, 4);
-  clk.drawFastHLine(4, 29, 232, 0x39E7);
-  clk.pushSprite(0, 0);
+  clk.drawString(t, 74, 4);
+  clk.pushSprite(162, 0);
   clk.deleteSprite();
+  tft.fillRect(158, 0, 4, 30, bgColor);
+  tft.drawFastHLine(4, 29, 232, 0x39E7);
   clk.unloadFont();
 }
 
 void displayToken()
 {
   clk.setColorDepth(8);
-  clk.loadFont(ZdyLwFont_20);
   tft.fillScreen(bgColor);
+  displayTokenHeader();
+  displayTokenBody();
+}
 
-  //标题栏
-  clk.createSprite(240, 30);
+void displayTokenBody()
+{
+  tft.fillRect(0, 30, 240, 210, bgColor);
+  drawTokenBodyPage(tokenPageIndex, false);
+}
+
+void displayTokenBodySlide()
+{
+  for (int x = 0; x < 240; x += 40) {
+    tft.fillRect(x, 30, 40, 210, bgColor);
+    delay(36);
+  }
+  drawTokenBodyPage(tokenPageIndex, true);
+  delay(140);
+  drawTokenBodyPage(tokenPageIndex, false);
+}
+
+void drawTokenBodyPage(int pageIndex, bool dim)
+{
+  clk.setColorDepth(8);
+  clk.loadFont(ZdyLwFont_20);
+  clk.createSprite(240, 210);
   clk.fillSprite(bgColor);
-  clk.setTextDatum(TL_DATUM);
-  clk.setTextColor(TFT_GREEN, bgColor);
-  clk.drawString("TOKEN PLAN", 4, 4);
-  String t = String(hour()<10?"0":"")+String(hour())+":"+
-             String(minute()<10?"0":"")+String(minute());
-  clk.setTextDatum(TR_DATUM);
-  clk.setTextColor(TFT_WHITE, bgColor);
-  clk.drawString(t, 236, 4);
-  clk.drawFastHLine(4, 29, 232, 0x39E7);
-  clk.pushSprite(0, 0);
-  clk.deleteSprite();
 
   if (Token_en == 0 || tokenServiceCount == 0) {
-    clk.createSprite(240, 60);
-    clk.fillSprite(bgColor);
     clk.setTextDatum(CC_DATUM);
     clk.setTextColor(0x7BEF, bgColor);
-    clk.drawString("Waiting for data...", 120, 30);
-    clk.pushSprite(0, 70);
+    clk.drawString("Waiting for data...", 120, 70);
+    clk.pushSprite(0, 30);
     clk.deleteSprite();
     clk.unloadFont();
     return;
@@ -1693,72 +1745,73 @@ void displayToken()
 
   int cardH = 56;
   int cardW = 226;
-  int startY = 34;
+  int startY = 4;
   int marginX = 7;
   int barH = 13;
   int barY_offset = 35;
-  int visibleCount = tokenServiceCount > 3 ? 3 : tokenServiceCount;
+  int pageCount = (tokenServiceCount + TOKEN_PAGE_SIZE - 1) / TOKEN_PAGE_SIZE;
+  if (pageCount <= 0) pageCount = 1;
+  if (pageIndex >= pageCount) pageIndex = 0;
+  int startIndex = pageIndex * TOKEN_PAGE_SIZE;
+  int visibleCount = tokenServiceCount - startIndex;
+  if (visibleCount > TOKEN_PAGE_SIZE) visibleCount = TOKEN_PAGE_SIZE;
 
   for (int i = 0; i < visibleCount; i++) {
     int y = startY + i * 58;
 
-    TokenService *s = &tokenServices[i];
+    TokenService *s = &tokenServices[startIndex + i];
 
     float pct = (s->limit > 0) ? (float)s->used / (float)s->limit * 100.0 : 0;
     if (pct > 100) pct = 100;
     if (pct < 0) pct = 0;
 
     uint16_t barColor;
-    if (pct < 50) barColor = 0x07E0;
-    else if (pct < 80) barColor = 0xFFE0;
-    else barColor = 0xF800;
+    if (pct < 50) barColor = dim ? 0x03E0 : 0x07E0;
+    else if (pct < 80) barColor = dim ? 0x7BE0 : 0xFFE0;
+    else barColor = dim ? 0x7800 : 0xF800;
 
-    uint16_t cardBg = 0x18E3;
+    uint16_t cardBg = dim ? 0x0841 : 0x18E3;
+    uint16_t borderColor = dim ? 0x2104 : 0x39E7;
+    uint16_t textColor = dim ? 0x8410 : TFT_WHITE;
+    uint16_t barBgColor = dim ? 0x18E3 : 0x39E7;
 
     //卡片背景
-    clk.createSprite(cardW, cardH);
-    clk.fillSprite(bgColor);
-    clk.fillRoundRect(0, 0, cardW, cardH, 4, cardBg);
-    clk.drawRoundRect(0, 0, cardW, cardH, 4, 0x39E7);
+    clk.fillRoundRect(marginX, y, cardW, cardH, 4, cardBg);
+    clk.drawRoundRect(marginX, y, cardW, cardH, 4, borderColor);
 
     //服务名称 + 百分比
     clk.setTextDatum(TL_DATUM);
-    clk.setTextColor(TFT_WHITE, cardBg);
-    clk.drawString(fitTokenText(s->name, 144), 10, 7);
+    clk.setTextColor(textColor, cardBg);
+    clk.drawString(fitTokenText(s->name, 144), marginX + 10, y + 7);
     String pctStr = String((int)pct) + "%";
     clk.setTextDatum(TR_DATUM);
-    if (pct >= 80) clk.setTextColor(TFT_RED, cardBg);
-    else if (pct >= 50) clk.setTextColor(TFT_YELLOW, cardBg);
-    else clk.setTextColor(TFT_GREEN, cardBg);
-    clk.drawString(pctStr, cardW - 10, 7);
+    if (pct >= 80) clk.setTextColor(dim ? 0x7800 : TFT_RED, cardBg);
+    else if (pct >= 50) clk.setTextColor(dim ? 0x7BE0 : TFT_YELLOW, cardBg);
+    else clk.setTextColor(dim ? 0x03E0 : TFT_GREEN, cardBg);
+    clk.drawString(pctStr, marginX + cardW - 10, y + 7);
 
     //进度条
     int barBgW = cardW - 20;
-    clk.fillRect(10, barY_offset, barBgW, barH, 0x39E7);
+    clk.fillRect(marginX + 10, y + barY_offset, barBgW, barH, barBgColor);
     int fillW = (int)((float)barBgW * pct / 100.0);
     if (pct > 0 && fillW < 2) fillW = 2;
-    if (fillW > 0) clk.fillRect(10, barY_offset, fillW, barH, barColor);
-
-    clk.pushSprite(marginX, y);
-    clk.deleteSprite();
+    if (fillW > 0) clk.fillRect(marginX + 10, y + barY_offset, fillW, barH, barColor);
   }
 
   //底部更新时间
-  clk.createSprite(240, 20);
-  clk.fillSprite(bgColor);
   clk.setTextDatum(CC_DATUM);
-  clk.setTextColor(0x7BEF, bgColor);
+  clk.setTextColor(dim ? 0x4208 : 0x7BEF, bgColor);
   String updateStr = "";
-  if (tokenServiceCount > visibleCount) {
-    updateStr = "+" + String(tokenServiceCount - visibleCount) + " more  ";
+  if (pageCount > 1) {
+    updateStr = String(pageIndex + 1) + "/" + String(pageCount) + "  ";
   }
   if (Token_update_time > 0) {
     updateStr += String(hour(Token_update_time)) + ":" +
                  String(minute(Token_update_time)<10?"0":"") + String(minute(Token_update_time)) + ":" +
                  String(second(Token_update_time)<10?"0":"") + String(second(Token_update_time));
   }
-  clk.drawString(updateStr, 120, 10);
-  clk.pushSprite(0, 216);
+  clk.drawString(updateStr, 120, 196);
+  clk.pushSprite(0, 30);
   clk.deleteSprite();
   clk.unloadFont();
 }

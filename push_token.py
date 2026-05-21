@@ -1,75 +1,465 @@
 #!/usr/bin/env python3
+"""
+push_token.py — 自动获取 AI 服务用量并推送到 ESP32 天气时钟
+
+数据来源:
+  - OpenAI/Codex: ~/.codex/auth.json → chatgpt.com/backend-api/wham/usage
+  - Antigravity:   ~/.antigravity_cockpit/accounts/{uuid}.json → 缓存的配额数据
+
+用法:
+  python3 push_token.py --fetch                     # 自动获取并推送
+  python3 push_token.py --fetch --interval 300      # 每5分钟自动刷新
+  python3 push_token.py --fetch --print             # 仅打印不推送
+  python3 push_token.py --list "ChatGPT,45,100;Claude,20,100"
+"""
 import requests
-import argparse
 import json
 import sys
+import os
+import time
+import argparse
+import base64
+from pathlib import Path
+
+CODEX_AUTH_FILE = os.path.expanduser("~/.codex/auth.json")
+AG_DIR = os.path.expanduser("~/.antigravity_cockpit")
+AG_ACCOUNTS_FILE = os.path.join(AG_DIR, "accounts.json")
+
+GOOGLE_CLIENT_ID = os.environ.get(
+    "GOOGLE_CLIENT_ID",
+    base64.b64decode(b"MTA3MTAwNjA2MDU5MS10bWhzc2luMmgyMWxjcmUyMzV2dG9sb2poNGc0MDNlcC5hcHBzLmdvb2dsZXVzZXJjb250ZW50LmNvbQ==").decode("utf-8")
+)
+GOOGLE_CLIENT_SECRET = os.environ.get(
+    "GOOGLE_CLIENT_SECRET",
+    base64.b64decode(b"R09DU1BYLUs1OEZXUjQ4NkxkTEoxbUxCOHNYQzR6cURBZg==").decode("utf-8")
+)
+CODEX_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann"
+
+AG_CLOUD_URL = "https://cloudcode-pa.googleapis.com"
+
+# ── OpenAI / Codex ────────────────────────────────────────────
+
+def load_codex_auth():
+    try:
+        return json.loads(Path(CODEX_AUTH_FILE).read_text())
+    except (FileNotFoundError, json.JSONDecodeError):
+        return None
+
+
+def save_codex_auth(auth):
+    auth["last_refresh"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    Path(CODEX_AUTH_FILE).write_text(json.dumps(auth, indent=2))
+
+
+def decode_jwt_exp(token):
+    """从 JWT 中提取过期时间 (exp)，失败返回 0"""
+    try:
+        payload = token.split(".")[1]
+        payload += "=" * (4 - len(payload) % 4)
+        data = json.loads(base64.urlsafe_b64decode(payload))
+        return data.get("exp", 0)
+    except Exception:
+        return 0
+
+
+def refresh_codex_token(refresh_token):
+    resp = requests.post(
+        "https://auth.openai.com/oauth/token",
+        data={
+            "grant_type": "refresh_token",
+            "refresh_token": refresh_token,
+            "client_id": CODEX_CLIENT_ID,
+        },
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+        timeout=10,
+    )
+    if resp.status_code == 200:
+        data = resp.json()
+        return data.get("access_token"), data.get("refresh_token")
+    print(f"  OpenAI token refresh failed: {resp.status_code} {resp.text[:200]}")
+    return None, None
+
+
+def ensure_codex_token(auth):
+    """确保 access_token 有效，必要时刷新"""
+    tokens = auth["tokens"]
+    token = tokens.get("access_token", "")
+    exp = decode_jwt_exp(token)
+    if exp and time.time() > exp - 60:
+        print("  OpenAI token expired, refreshing...")
+        new_token, new_refresh = refresh_codex_token(tokens.get("refresh_token", ""))
+        if new_token:
+            tokens["access_token"] = new_token
+            if new_refresh:
+                tokens["refresh_token"] = new_refresh
+            save_codex_auth(auth)
+            return new_token
+        print("  OpenAI token refresh failed, using existing token (may fail)")
+    return token
+
+
+def fetch_openai_usage():
+    """从 ChatGPT 后端 API 获取用量。"""
+    auth = load_codex_auth()
+    if not auth:
+        print("[OpenAI] 未找到 ~/.codex/auth.json")
+        return []
+
+    token = ensure_codex_token(auth)
+    account_id = auth["tokens"]["account_id"]
+
+    resp = requests.get(
+        "https://chatgpt.com/backend-api/wham/usage",
+        headers={
+            "Authorization": f"Bearer {token}",
+            "ChatGPT-Account-Id": account_id,
+            "Accept": "application/json",
+        },
+        timeout=10,
+    )
+
+    if resp.status_code == 401:
+        print("[OpenAI] 401, 尝试刷新后重试...")
+        new_token, _ = refresh_codex_token(auth["tokens"].get("refresh_token", ""))
+        if new_token:
+            auth["tokens"]["access_token"] = new_token
+            save_codex_auth(auth)
+            resp = requests.get(
+                "https://chatgpt.com/backend-api/wham/usage",
+                headers={
+                    "Authorization": f"Bearer {new_token}",
+                    "ChatGPT-Account-Id": account_id,
+                    "Accept": "application/json",
+                },
+                timeout=10,
+            )
+
+    if resp.status_code != 200:
+        print(f"[OpenAI] API 返回 {resp.status_code}: {resp.text[:200]}")
+        return []
+
+    data = resp.json()
+    rate_limit = data.get("rate_limit", {})
+    plan_type = data.get("plan_type", "ChatGPT")
+
+    services = []
+    primary = rate_limit.get("primary_window", {})
+    if primary:
+        used_pct = int(primary.get("used_percent", 0))
+        boost = primary.get("boost_call_info", {})
+        boost_used = boost.get("rate_limit", {}).get("used_percent")
+
+        name = "CodeX"
+        if boost_used is not None:
+            name += " +boost"
+            used_pct = int(boost_used)
+
+        services.append({
+            "name": name,
+            "used": used_pct,
+            "limit": 100,
+        })
+        print(f"[OpenAI] {name}: {used_pct}%")
+
+    return services
+
+
+# ── Antigravity ────────────────────────────────────────────────
+
+def load_antigravity_account():
+    try:
+        index = json.loads(Path(AG_ACCOUNTS_FILE).read_text())
+        current_id = index.get("current_account_id")
+        if not current_id:
+            return None
+        path = os.path.join(AG_DIR, "accounts", f"{current_id}.json")
+        return json.loads(Path(path).read_text())
+    except (FileNotFoundError, json.JSONDecodeError):
+        return None
+
+
+def save_antigravity_token(account, new_access_token, expires_in=3599):
+    """刷新后写回 token"""
+    account["token"]["access_token"] = new_access_token
+    account["token"]["expiry_timestamp"] = int(time.time()) + expires_in
+    path = os.path.join(AG_DIR, "accounts", f"{account['id']}.json")
+    Path(path).write_text(json.dumps(account, indent=2))
+    # 同步更新备份文件
+    bak_path = os.path.join(AG_DIR, "accounts", f"{account['id']}.json.bak")
+    if os.path.exists(bak_path):
+        Path(bak_path).write_text(json.dumps(account, indent=2))
+
+
+def refresh_ag_token(refresh_token):
+    resp = requests.post(
+        "https://oauth2.googleapis.com/token",
+        data={
+            "grant_type": "refresh_token",
+            "refresh_token": refresh_token,
+            "client_id": GOOGLE_CLIENT_ID,
+            "client_secret": GOOGLE_CLIENT_SECRET,
+        },
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+        timeout=10,
+    )
+    if resp.status_code == 200:
+        data = resp.json()
+        return data.get("access_token"), data.get("expires_in", 3599)
+    print(f"  Antigravity token refresh failed: {resp.status_code} {resp.text[:200]}")
+    return None, None
+
+
+def ensure_ag_token(account):
+    token = account.get("token", {})
+    expiry = token.get("expiry_timestamp", 0)
+    if expiry and time.time() > expiry - 300:
+        print("  Antigravity token expired, refreshing...")
+        new_token, expires_in = refresh_ag_token(token.get("refresh_token", ""))
+        if new_token:
+            save_antigravity_token(account, new_token, expires_in)
+            return new_token
+        print("  Antigravity token refresh failed")
+    return token.get("access_token", "")
+
+
+def fetch_antigravity_live(account):
+    """通过 Google Cloud Code Assist API 实时获取配额。"""
+    token = ensure_ag_token(account)
+    if not token:
+        return []
+
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json",
+        "User-Agent": "antigravity/1.20.5",
+    }
+
+    # Step 1: loadCodeAssist → 获取 project_id
+    resp = requests.post(
+        f"{AG_CLOUD_URL}/v1internal:loadCodeAssist",
+        json={},
+        headers=headers,
+        timeout=15,
+    )
+    if resp.status_code != 200:
+        print(f"[Antigravity] loadCodeAssist 返回 {resp.status_code}")
+        return []
+
+    data = resp.json()
+    project_id = data.get("projectId", "")
+
+    # Step 2: fetchAvailableModels → 获取各模型配额
+    resp = requests.post(
+        f"{AG_CLOUD_URL}/v1internal:fetchAvailableModels",
+        json={"project": project_id},
+        headers=headers,
+        timeout=15,
+    )
+    if resp.status_code != 200:
+        print(f"[Antigravity] fetchAvailableModels 返回 {resp.status_code}")
+        return []
+
+    models_data = resp.json().get("models", {})
+
+    # 过滤废弃/内部模型
+    SKIP_PREFIX = ("gemini-2.5", "chat_", "tab_", "gpt-oss-")
+    filtered = {}
+    for name, info in models_data.items():
+        if any(name.startswith(p) for p in SKIP_PREFIX):
+            continue
+        filtered[name] = info
+
+    def sort_key(item):
+        name, info = item
+        quota = info.get("quotaInfo", {})
+        used = (1 - quota.get("remainingFraction", 1)) * 100
+        score = used * 100
+        if "claude" in name.lower():
+            score += 30
+        elif "pro" in name.lower():
+            score += 10
+        elif "flash" in name.lower():
+            score -= 5
+        return score
+
+    sorted_models = sorted(filtered.items(), key=sort_key, reverse=True)
+
+    services = []
+    seen = set()
+    for name, info in sorted_models:
+        if len(services) >= 3:
+            break
+        display = info.get("displayName", name)
+        key = display.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+
+        quota = info.get("quotaInfo", {})
+        remaining = quota.get("remainingFraction", 1) * 100
+        used_pct = max(0, int(100 - remaining))
+
+        services.append({
+            "name": display,
+            "used": used_pct,
+            "limit": 100,
+        })
+        print(f"[Antigravity] {display}: {remaining:.0f}% remaining (live)")
+
+    return services
+
+
+def fetch_antigravity_usage():
+    """通过 Google Cloud Code Assist API 实时获取配额，fallback 到本地缓存。"""
+    account = load_antigravity_account()
+    if not account:
+        print("[Antigravity] 未找到账号文件")
+        return []
+
+    # 优先走实时 API，获取最新用量
+    services = fetch_antigravity_live(account)
+    if services:
+        return services
+
+    # fallback: 使用 cockpit-tools 本地缓存
+    quota = account.get("quota", {})
+    models = quota.get("models", [])
+    if not models:
+        print("[Antigravity] 无缓存数据")
+        return []
+
+    tier = quota.get("subscription_tier", "?")
+
+    # 过滤废弃模型 (gemini-2.5-*)
+    models = [m for m in models if "gemini-2.5" not in m.get("name", "")]
+
+    def sort_key(m):
+        name = m.get("name", "")
+        used = 100 - m.get("percentage", 100)
+        score = used * 100
+        if "claude" in name.lower():
+            score += 30
+        elif "pro" in name.lower():
+            score += 10
+        return score
+
+    models_sorted = sorted(models, key=sort_key, reverse=True)
+
+    services = []
+    seen = set()
+    for m in models_sorted:
+        display = m.get("display_name", m.get("name", "?"))
+        key = display.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        remaining = m.get("percentage", 100)
+        used_pct = max(0, 100 - int(remaining))
+        services.append({"name": display, "used": used_pct, "limit": 100})
+        print(f"[Antigravity] {display}: {remaining}% remaining (tier={tier}, cached)")
+        if len(services) >= 3:
+            break
+
+    return services
+
+
+# ── 主逻辑 ─────────────────────────────────────────────────────
+
+def fetch_all():
+    print("── 获取用量 ──")
+    services = []
+
+    print("\n▸ OpenAI / Codex:")
+    services.extend(fetch_openai_usage())
+
+    print("\n▸ Antigravity:")
+    services.extend(fetch_antigravity_usage())
+
+    if not services:
+        print("\n⚠ 未获取到任何服务数据")
+    else:
+        total = len(services)
+        print(f"\n── 共 {total} 个服务 ──")
+    return services
+
+
+def push_to_esp32(host, services):
+    payload = {"services": services}
+    url = f"http://{host}/token"
+    try:
+        resp = requests.post(url, json=payload, timeout=5)
+        print(f"ESP32 [{resp.status_code}]: {resp.text.strip()}")
+        return resp.status_code == 200
+    except requests.exceptions.ConnectionError:
+        print(f"✗ 无法连接 {host}，请确认 ESP32 在同一网络")
+        return False
+    except requests.exceptions.Timeout:
+        print(f"✗ 连接 {host} 超时")
+        return False
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Push token plan usage data to ESP32 weather clock"
+        description="获取 AI 服务用量并推送到 ESP32 天气时钟",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""示例:
+  python3 push_token.py --fetch                    自动获取并推送
+  python3 push_token.py --fetch --print            仅打印不推送
+  python3 push_token.py --fetch --interval 300     每5分钟自动刷新
+  python3 push_token.py --list "ChatGPT,45,100;Claude,20,100"
+        """,
     )
-    parser.add_argument(
-        "--host", default="sd3.local",
-        help="ESP32 hostname or IP (default: sd3.local)"
-    )
-    parser.add_argument(
-        "--file", "-f",
-        help="JSON file path containing token data"
-    )
-    parser.add_argument(
-        "--inline",
-        help='Inline JSON string, e.g. \'{"services":[{"name":"OpenAI","used":150000,"limit":500000}]}\''
-    )
-    parser.add_argument(
-        "--list",
-        help="Comma-separated list: name,used,limit;name,used,limit;...",
-    )
+    parser.add_argument("--host", default="sd3.local", help="ESP32 地址 (默认: sd3.local)")
+    parser.add_argument("-f", "--file", help="JSON 文件路径")
+    parser.add_argument("--inline", help="内联 JSON 字符串")
+    parser.add_argument("--list", help="逗号分隔: name,used,limit;name,used,limit;...")
+    parser.add_argument("--fetch", action="store_true", help="自动从本地配置文件获取用量")
+    parser.add_argument("--interval", type=int, default=0, help="每 N 秒执行一次 (0=仅一次)")
+    parser.add_argument("--print", action="store_true", help="仅打印 JSON, 不推送")
     args = parser.parse_args()
 
-    payload = {}
-
-    if args.file:
-        with open(args.file, "r") as f:
-            payload = json.load(f)
-    elif args.inline:
-        payload = json.loads(args.inline)
-    elif args.list:
-        services = []
-        for item in args.list.strip(";").split(";"):
-            parts = item.strip().split(",")
-            if len(parts) == 3:
-                services.append({
-                    "name": parts[0].strip(),
-                    "used": int(parts[1].strip()),
-                    "limit": int(parts[2].strip()),
-                })
-        payload = {"services": services}
-    else:
-        parser.print_help()
-        print("\nExample usage:")
-        print('  python3 push_token.py --inline \'{"services":[{"name":"OpenAI","used":150000,"limit":500000}]}\'')
-        print('  python3 push_token.py --list "OpenAI,150000,500000;Anthropic,80000,200000"')
-        print('  python3 push_token.py -f data.json')
-        sys.exit(1)
-
-    url = f"http://{args.host}/token"
-    try:
-        resp = requests.post(url, json=payload, timeout=5)
-        print(f"Status: {resp.status_code}")
-        print(f"Response: {resp.text}")
-        if resp.status_code == 200:
-            print("Token data pushed successfully!")
+    def build_payload():
+        if args.file:
+            with open(args.file) as f:
+                return json.load(f)
+        elif args.inline:
+            return json.loads(args.inline)
+        elif args.list:
+            services = []
+            for item in args.list.strip(";").split(";"):
+                parts = item.strip().split(",")
+                if len(parts) >= 3:
+                    services.append({
+                        "name": parts[0].strip(),
+                        "used": int(parts[1].strip()),
+                        "limit": int(parts[2].strip()),
+                    })
+            return {"services": services}
+        elif args.fetch:
+            svcs = fetch_all()
+            return {"services": svcs}
         else:
-            print("Failed to push token data.")
+            parser.print_help()
             sys.exit(1)
-    except requests.exceptions.ConnectionError:
-        print(f"Error: Cannot connect to {args.host}")
-        print("Make sure the ESP32 is on the same network and the web server is running.")
-        sys.exit(1)
-    except requests.exceptions.Timeout:
-        print(f"Error: Connection to {args.host} timed out")
-        sys.exit(1)
+
+    payload = build_payload()
+
+    if args.print:
+        print(json.dumps(payload, indent=2))
+        return
+
+    if args.interval > 0:
+        print(f"运行间隔: {args.interval}s, Ctrl+C 停止")
+        first = True
+        while True:
+            if not first and args.fetch:
+                payload["services"] = fetch_all()
+            first = False
+            push_to_esp32(args.host, payload["services"])
+            print(f"── 等待 {args.interval}s ──\n")
+            time.sleep(args.interval)
+    else:
+        push_to_esp32(args.host, payload["services"])
 
 
 if __name__ == "__main__":
