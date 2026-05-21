@@ -1,0 +1,10 @@
+# 忽略 OS 产生的文件
+.DS_Store
+Thumbs.db
+db/
+
+# 忽略编译输出目录
+build_out/
+*.bin
+*.elf
+*.map
