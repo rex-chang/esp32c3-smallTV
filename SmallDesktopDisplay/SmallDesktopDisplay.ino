@@ -235,6 +235,7 @@ void readCityCodefromEEP(int * citycode);
 #if WebSever_EN
 void handleTokenPost();
 void displayToken();
+void displayTokenHeader();
 #endif
 
 /* *****************************************************************
@@ -1186,24 +1187,33 @@ void setup()
   //   CityCODE = CityCODE*100;
   //   CityCODE += EEPROM.read(CC_addr+cnum-1);
   //   delay(5);
-  // }
-  if(CityCODE>=101000000 && CityCODE<=102000000)
-    cityCode = CityCODE;
-  else
-    getCityCode();  //获取城市代码
+	  // }
+	  if(CityCODE>=101000000 && CityCODE<=102000000)
+	    cityCode = CityCODE;
+	  else if(DISP_mode == 0)
+	    getCityCode();  //获取城市代码
 
-  tft.fillScreen(TFT_BLACK);//清屏
+	  tft.fillScreen(TFT_BLACK);//清屏
 
-  TJpgDec.drawJpg(15,183,temperature, sizeof(temperature));  //温度图标
-  TJpgDec.drawJpg(15,213,humidity, sizeof(humidity));  //湿度图标
+  #if WebSever_EN
+	  if(DISP_mode == 1)
+	  {
+	    displayToken();
+	  }
+	  else
+  #endif
+	  {
+	    TJpgDec.drawJpg(15,183,temperature, sizeof(temperature));  //温度图标
+	    TJpgDec.drawJpg(15,213,humidity, sizeof(humidity));  //湿度图标
 
-  getCityWeater();
+	    getCityWeater();
 #if DHT_EN
-  if(DHT_img_flag != 0)
-  IndoorTem();
+	    if(DHT_img_flag != 0)
+	    IndoorTem();
 #endif
+	  }
 #if !WebSever_EN
-  WiFi.forceSleepBegin(); //wifi off
+	  WiFi.forceSleepBegin(); //wifi off
   Serial.println("WIFI休眠......");
   Wifi_en = 0;
 #endif
@@ -1225,12 +1235,17 @@ void LCD_reflash(int en)
   //Token Plan 模式
   #if WebSever_EN
   if (DISP_mode == 1) {
-    if (en == 1 || Token_en == 2 || minute() != prevTokenMinute)
+    if (en == 1 || Token_en == 2)
     {
       if (en == 1) tft.fillScreen(0x0000);
       prevTokenMinute = minute();
       if (Token_en == 2) Token_en = 1;
       displayToken();
+    }
+    else if (minute() != prevTokenMinute)
+    {
+      prevTokenMinute = minute();
+      displayTokenHeader();
     }
     return;
   }
@@ -1621,6 +1636,26 @@ String fitTokenText(String text, int maxWidth)
     removeLastUtf8Char(text);
   }
   return text + "~";
+}
+
+void displayTokenHeader()
+{
+  clk.setColorDepth(8);
+  clk.loadFont(ZdyLwFont_20);
+  clk.createSprite(240, 30);
+  clk.fillSprite(bgColor);
+  clk.setTextDatum(TL_DATUM);
+  clk.setTextColor(TFT_GREEN, bgColor);
+  clk.drawString("TOKEN PLAN", 4, 4);
+  String t = String(hour()<10?"0":"")+String(hour())+":"+
+             String(minute()<10?"0":"")+String(minute());
+  clk.setTextDatum(TR_DATUM);
+  clk.setTextColor(TFT_WHITE, bgColor);
+  clk.drawString(t, 236, 4);
+  clk.drawFastHLine(4, 29, 232, 0x39E7);
+  clk.pushSprite(0, 0);
+  clk.deleteSprite();
+  clk.unloadFont();
 }
 
 void displayToken()
