@@ -155,12 +155,28 @@ uint8_t UpdateWeater_en = 0; //更新时间标志位
 int prevTime = 0;       //滚动显示更新标志位
 int DHT_img_flag = 0;   //DHT传感器使用标志位
 
+//Token Plan 显示
+uint8_t DISP_mode = 0;     //显示模式 0=天气, 1=Token Plan
+uint8_t Token_en = 0;      //0=无数据, 1=有数据已显示, 2=新数据待刷新
+int prevTokenMinute = -1;  //Token模式时钟分钟记录
+String Token_JSON = "{}";   //存储原始JSON
+unsigned long Token_update_time = 0;
+
+#define MAX_SERVICES 5
+struct TokenService {
+  String name;
+  long used;
+  long limit;
+};
+TokenService tokenServices[MAX_SERVICES];
+int tokenServiceCount = 0;
 
 //EEPROM参数存储地址位
 int BL_addr = 1;//被写入数据的EEPROM地址编号  1亮度
 int Ro_addr = 2; //被写入数据的EEPROM地址编号  2 旋转方向
 int DHT_addr = 3;//3 DHT使能标志位
 int UpWeT_addr = 4; //4 更新时间记录
+int DISP_addr = 5;  //5 显示模式 0=天气, 1=Token Plan
 int CC_addr = 10;//被写入数据的EEPROM地址编号  10城市
 int wifi_addr = 30; //被写入数据的EEPROM地址编号  20wifi-ssid-psw
 int Warn_Number1 = 0,Warn_Value1 = 0,Warn_Number2 = 0,Warn_Value2 = 0,Warn_Flag = 1;
@@ -216,6 +232,10 @@ void Web_Sever();
 #endif
 void saveCityCodetoEEP(int * citycode);
 void readCityCodefromEEP(int * citycode);
+#if WebSever_EN
+void handleTokenPost();
+void displayToken();
+#endif
 
 /* *****************************************************************
  *  函数
@@ -573,6 +593,18 @@ void Serial_set()
         SMOD = "";
         ESP.restart();
       }
+      else if(SMOD=="0x07")
+      {
+        DISP_mode = (DISP_mode == 0) ? 1 : 0;
+        EEPROM.write(DISP_addr, DISP_mode);
+        EEPROM.commit();
+        delay(5);
+        tft.fillScreen(0x0000);
+        LCD_reflash(1);
+        SMOD = "";
+        Serial.print("Display Mode: ");
+        Serial.println(DISP_mode == 0 ? "Weather" : "Token Plan");
+      }
       else
       {
         Serial.println("");
@@ -582,6 +614,7 @@ void Serial_set()
         Serial.println("屏幕方向设置输入    0x03");
         Serial.println("更改天气更新时间    0x04");
         Serial.println("重置WiFi(会重启)    0x05");
+        Serial.println("切换显示模式        0x07");
         Serial.println("");
       }
     }
@@ -589,15 +622,58 @@ void Serial_set()
 }
 
 #if WebSever_EN
+//Token Plan 数据推送接口
+void handleTokenPost()
+{
+  if (server.hasArg("plain")) {
+    String body = server.arg("plain");
+    DynamicJsonDocument doc(1024);
+    DeserializationError error = deserializeJson(doc, body);
+
+    if (error) {
+      server.send(400, "application/json", "{\"error\":\"Invalid JSON\"}");
+      return;
+    }
+
+    JsonArray services = doc["services"].as<JsonArray>();
+    tokenServiceCount = 0;
+
+    for (JsonObject s : services) {
+      if (tokenServiceCount >= MAX_SERVICES) break;
+      tokenServices[tokenServiceCount].name = s["name"].as<String>();
+      tokenServices[tokenServiceCount].used = s["used"].as<long>();
+      tokenServices[tokenServiceCount].limit = s["limit"].as<long>();
+      tokenServiceCount++;
+    }
+
+    Token_en = 2;
+    Token_update_time = now();
+    Token_JSON = body;
+
+    if (DISP_mode == 1) {
+      LCD_reflash(0);
+    }
+
+    Serial.print("Token data received: ");
+    Serial.print(tokenServiceCount);
+    Serial.println(" services");
+
+    String resp = "{\"status\":\"ok\",\"services\":" + String(tokenServiceCount) + "}";
+    server.send(200, "application/json", resp);
+  } else {
+    server.send(400, "application/json", "{\"error\":\"No body\"}");
+  }
+}
+
 //web网站相关函数
 //web设置页面
 void handleconfig()
 {
   String msg;
-  int web_cc,web_setro,web_lcdbl,web_upt,web_dhten;
+  int web_cc,web_setro,web_lcdbl,web_upt,web_dhten,web_disp_mode;
 
   if (server.hasArg("web_ccode") || server.hasArg("web_bl") || \
-      server.hasArg("web_upwe_t") || server.hasArg("web_DHT11_en") || server.hasArg("web_set_rotation"))
+      server.hasArg("web_upwe_t") || server.hasArg("web_DHT11_en") || server.hasArg("web_set_rotation") || server.hasArg("web_disp_mode"))
   {
     web_cc    = server.arg("web_ccode").toInt();
     web_setro = server.arg("web_set_rotation").toInt();
@@ -666,6 +742,22 @@ void handleconfig()
     }
     Serial.print("LCD Rotation:");
     Serial.println(LCD_Rotation);
+
+    if(server.hasArg("web_disp_mode"))
+    {
+      web_disp_mode = server.arg("web_disp_mode").toInt();
+      if(web_disp_mode != DISP_mode)
+      {
+        DISP_mode = web_disp_mode;
+        EEPROM.write(DISP_addr, DISP_mode);
+        EEPROM.commit();
+        delay(5);
+        tft.fillScreen(0x0000);
+        LCD_reflash(1);
+        Serial.print("Display Mode: ");
+        Serial.println(DISP_mode == 0 ? "Weather" : "Token Plan");
+      }
+    }
   }
 
   //网页界面代码段
@@ -683,6 +775,9 @@ void handleconfig()
                     <input type='radio' name='web_set_rotation' value='1'> USB Right<br>\
                     <input type='radio' name='web_set_rotation' value='2'> USB Up<br>\
                     <input type='radio' name='web_set_rotation' value='3'> USB Left<br>";
+        content += "<br>Display Mode<br>\
+                    <input type='radio' name='web_disp_mode' value='0' checked> Weather<br>\
+                    <input type='radio' name='web_disp_mode' value='1'> Token Plan<br>";
         content += "<br><div><input type='submit' name='Save' value='Save'></form></div>" + msg + "<br>";
         content += "By WCY<br>";
         content += "</body></html>";
@@ -722,6 +817,7 @@ void Web_Sever_Init()
   // Serial.println(WiFi.localIP());
 
   server.on("/", handleconfig);
+  server.on("/token", HTTP_POST, handleTokenPost);
   server.onNotFound(handleNotFound);
 
   //开启TCP服务
@@ -992,6 +1088,11 @@ void setup()
   //从eeprom读取天气更新时间
   updateweater_time = EEPROM.read(UpWeT_addr);
 
+  //从eeprom读取显示模式
+  uint8_t savedDisp = EEPROM.read(DISP_addr);
+  if (savedDisp == 0 || savedDisp == 1)
+    DISP_mode = savedDisp;
+
 
 
   tft.begin(); /* TFT init */
@@ -1121,6 +1222,20 @@ void loop()
 
 void LCD_reflash(int en)
 {
+  //Token Plan 模式
+  #if WebSever_EN
+  if (DISP_mode == 1) {
+    if (en == 1 || Token_en == 2 || minute() != prevTokenMinute)
+    {
+      if (en == 1) tft.fillScreen(0x0000);
+      prevTokenMinute = minute();
+      if (Token_en == 2) Token_en = 1;
+      displayToken();
+    }
+    return;
+  }
+  #endif
+
   if (now() != prevDisplay || en == 1)
   {
     prevDisplay = now();
@@ -1490,6 +1605,130 @@ void scrollBanner(){
     prevTime = 1;
 //  }
 }
+
+#if WebSever_EN
+void removeLastUtf8Char(String &text)
+{
+  int cut = text.length() - 1;
+  while (cut > 0 && ((uint8_t)text[cut] & 0xC0) == 0x80) cut--;
+  text.remove(cut);
+}
+
+String fitTokenText(String text, int maxWidth)
+{
+  if (clk.textWidth(text) <= maxWidth) return text;
+  while (text.length() > 0 && clk.textWidth(text + "~") > maxWidth) {
+    removeLastUtf8Char(text);
+  }
+  return text + "~";
+}
+
+void displayToken()
+{
+  clk.setColorDepth(8);
+  clk.loadFont(ZdyLwFont_20);
+  tft.fillScreen(bgColor);
+
+  //标题栏
+  clk.createSprite(240, 30);
+  clk.fillSprite(bgColor);
+  clk.setTextDatum(TL_DATUM);
+  clk.setTextColor(TFT_GREEN, bgColor);
+  clk.drawString("TOKEN PLAN", 4, 4);
+  String t = String(hour()<10?"0":"")+String(hour())+":"+
+             String(minute()<10?"0":"")+String(minute());
+  clk.setTextDatum(TR_DATUM);
+  clk.setTextColor(TFT_WHITE, bgColor);
+  clk.drawString(t, 236, 4);
+  clk.drawFastHLine(4, 29, 232, 0x39E7);
+  clk.pushSprite(0, 0);
+  clk.deleteSprite();
+
+  if (Token_en == 0 || tokenServiceCount == 0) {
+    clk.createSprite(240, 60);
+    clk.fillSprite(bgColor);
+    clk.setTextDatum(CC_DATUM);
+    clk.setTextColor(0x7BEF, bgColor);
+    clk.drawString("Waiting for data...", 120, 30);
+    clk.pushSprite(0, 70);
+    clk.deleteSprite();
+    clk.unloadFont();
+    return;
+  }
+
+  int cardH = 56;
+  int cardW = 226;
+  int startY = 34;
+  int marginX = 7;
+  int barH = 13;
+  int barY_offset = 35;
+  int visibleCount = tokenServiceCount > 3 ? 3 : tokenServiceCount;
+
+  for (int i = 0; i < visibleCount; i++) {
+    int y = startY + i * 58;
+
+    TokenService *s = &tokenServices[i];
+
+    float pct = (s->limit > 0) ? (float)s->used / (float)s->limit * 100.0 : 0;
+    if (pct > 100) pct = 100;
+    if (pct < 0) pct = 0;
+
+    uint16_t barColor;
+    if (pct < 50) barColor = 0x07E0;
+    else if (pct < 80) barColor = 0xFFE0;
+    else barColor = 0xF800;
+
+    uint16_t cardBg = 0x18E3;
+
+    //卡片背景
+    clk.createSprite(cardW, cardH);
+    clk.fillSprite(bgColor);
+    clk.fillRoundRect(0, 0, cardW, cardH, 4, cardBg);
+    clk.drawRoundRect(0, 0, cardW, cardH, 4, 0x39E7);
+
+    //服务名称 + 百分比
+    clk.setTextDatum(TL_DATUM);
+    clk.setTextColor(TFT_WHITE, cardBg);
+    clk.drawString(fitTokenText(s->name, 144), 10, 7);
+    String pctStr = String((int)pct) + "%";
+    clk.setTextDatum(TR_DATUM);
+    if (pct >= 80) clk.setTextColor(TFT_RED, cardBg);
+    else if (pct >= 50) clk.setTextColor(TFT_YELLOW, cardBg);
+    else clk.setTextColor(TFT_GREEN, cardBg);
+    clk.drawString(pctStr, cardW - 10, 7);
+
+    //进度条
+    int barBgW = cardW - 20;
+    clk.fillRect(10, barY_offset, barBgW, barH, 0x39E7);
+    int fillW = (int)((float)barBgW * pct / 100.0);
+    if (pct > 0 && fillW < 2) fillW = 2;
+    if (fillW > 0) clk.fillRect(10, barY_offset, fillW, barH, barColor);
+
+    clk.pushSprite(marginX, y);
+    clk.deleteSprite();
+  }
+
+  //底部更新时间
+  clk.createSprite(240, 20);
+  clk.fillSprite(bgColor);
+  clk.setTextDatum(CC_DATUM);
+  clk.setTextColor(0x7BEF, bgColor);
+  String updateStr = "";
+  if (tokenServiceCount > visibleCount) {
+    updateStr = "+" + String(tokenServiceCount - visibleCount) + " more  ";
+  }
+  if (Token_update_time > 0) {
+    updateStr += String(hour(Token_update_time)) + ":" +
+                 String(minute(Token_update_time)<10?"0":"") + String(minute(Token_update_time)) + ":" +
+                 String(second(Token_update_time)<10?"0":"") + String(second(Token_update_time));
+  }
+  clk.drawString(updateStr, 120, 10);
+  clk.pushSprite(0, 216);
+  clk.deleteSprite();
+  clk.unloadFont();
+}
+#endif
+
 #if imgAst_EN
 void imgAnim()
 {
