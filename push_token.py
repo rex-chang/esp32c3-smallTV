@@ -269,43 +269,43 @@ def fetch_antigravity_live(account):
             continue
         filtered[name] = info
 
-    def sort_key(item):
-        name, info = item
-        quota = info.get("quotaInfo", {})
-        used = (1 - quota.get("remainingFraction", 1)) * 100
-        score = used * 100
-        if "claude" in name.lower():
-            score += 30
-        elif "pro" in name.lower():
-            score += 10
-        elif "flash" in name.lower():
-            score -= 5
-        return score
-
-    sorted_models = sorted(filtered.items(), key=sort_key, reverse=True)
-
-    services = []
-    seen = set()
-    for name, info in sorted_models:
-        if len(services) >= 3:
-            break
+    # 分组模型
+    groups = {
+        'Claude': [],
+        'Gemini Pro': [],
+        'Gemini Flash': [],
+    }
+    
+    for name, info in filtered.items():
         display = info.get("displayName", name)
-        key = display.lower()
-        if key in seen:
-            continue
-        seen.add(key)
-
         quota = info.get("quotaInfo", {})
-        remaining = quota.get("remainingFraction", 1) * 100
+        remaining_frac = quota.get("remainingFraction")
+        remaining = remaining_frac * 100 if remaining_frac is not None else 0
         used_pct = max(0, int(100 - remaining))
-
-        services.append({
-            "name": display,
-            "used": used_pct,
-            "limit": 100,
-        })
-        print(f"[Antigravity] {display}: {remaining:.0f}% remaining (live)")
-
+        
+        # 分类模型
+        if 'Claude' in display:
+            groups['Claude'].append((display, used_pct, remaining))
+        elif 'Pro' in display:
+            groups['Gemini Pro'].append((display, used_pct, remaining))
+        elif 'Flash' in display:
+            groups['Gemini Flash'].append((display, used_pct, remaining))
+    
+    # 显示分组后的平均使用情况
+    services = []
+    for group_name, models in groups.items():
+        if models:
+            # 计算平均剩余百分比
+            avg_remaining = sum(m[2] for m in models) / len(models)
+            avg_used = 100 - avg_remaining
+            
+            services.append({
+                "name": group_name,
+                "used": int(avg_used),
+                "limit": 100,
+            })
+            print(f"[Antigravity] {group_name}: {avg_remaining:.0f}% remaining (live)")
+    
     return services
 
 
@@ -316,51 +316,56 @@ def fetch_antigravity_usage():
         print("[Antigravity] 未找到账号文件")
         return []
 
-    # 优先走实时 API，获取最新用量
-    services = fetch_antigravity_live(account)
-    if services:
-        return services
-
-    # fallback: 使用 cockpit-tools 本地缓存
+    # 优先使用本地缓存数据（更准确）
     quota = account.get("quota", {})
     models = quota.get("models", [])
-    if not models:
-        print("[Antigravity] 无缓存数据")
-        return []
+    if models:
+        tier = quota.get("subscription_tier", "?")
+        # 过滤废弃模型 (gemini-2.5-*)
+        models = [m for m in models if "gemini-2.5" not in m.get("name", "")]
 
-    tier = quota.get("subscription_tier", "?")
+        # 分组模型
+        groups = {
+            'Claude': [],
+            'Gemini Pro': [],
+            'Gemini Flash': [],
+        }
+        
+        for m in models:
+            display = m.get("display_name", m.get("name", "?"))
+            remaining = m.get("percentage")
+            remaining_val = remaining if remaining is not None else 0
+            used_pct = max(0, 100 - int(remaining_val))
+            
+            # 分类模型
+            if 'Claude' in display:
+                groups['Claude'].append((display, used_pct, remaining_val))
+            elif 'Pro' in display:
+                groups['Gemini Pro'].append((display, used_pct, remaining_val))
+            elif 'Flash' in display:
+                groups['Gemini Flash'].append((display, used_pct, remaining_val))
+        
+        # 显示分组后的平均使用情况
+        services = []
+        for group_name, models in groups.items():
+            if models:
+                # 计算平均剩余百分比
+                avg_remaining = sum(m[2] for m in models) / len(models)
+                avg_used = 100 - avg_remaining
+                
+                services.append({
+                    "name": group_name,
+                    "used": int(avg_used),
+                    "limit": 100,
+                })
+                print(f"[Antigravity] {group_name}: {avg_remaining:.0f}% remaining (cached)")
+        
+        if services:
+            return services
 
-    # 过滤废弃模型 (gemini-2.5-*)
-    models = [m for m in models if "gemini-2.5" not in m.get("name", "")]
-
-    def sort_key(m):
-        name = m.get("name", "")
-        used = 100 - m.get("percentage", 100)
-        score = used * 100
-        if "claude" in name.lower():
-            score += 30
-        elif "pro" in name.lower():
-            score += 10
-        return score
-
-    models_sorted = sorted(models, key=sort_key, reverse=True)
-
-    services = []
-    seen = set()
-    for m in models_sorted:
-        display = m.get("display_name", m.get("name", "?"))
-        key = display.lower()
-        if key in seen:
-            continue
-        seen.add(key)
-        remaining = m.get("percentage", 100)
-        used_pct = max(0, 100 - int(remaining))
-        services.append({"name": display, "used": used_pct, "limit": 100})
-        print(f"[Antigravity] {display}: {remaining}% remaining (tier={tier}, cached)")
-        if len(services) >= 3:
-            break
-
-    return services
+    # 如果缓存数据不存在，尝试实时API
+    print("[Antigravity] 缓存数据不存在，尝试实时API...")
+    return fetch_antigravity_live(account)
 
 
 # ── 主逻辑 ─────────────────────────────────────────────────────
