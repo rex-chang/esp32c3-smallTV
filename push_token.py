@@ -7,9 +7,9 @@ push_token.py — 自动获取 AI 服务用量并推送到 ESP32 天气时钟
   - Antigravity:   ~/.antigravity_cockpit/accounts/{uuid}.json → 缓存的配额数据
 
 用法:
-  python3 push_token.py --fetch                     # 自动获取并推送
-  python3 push_token.py --fetch --interval 300      # 每5分钟自动刷新
-  python3 push_token.py --fetch --print             # 仅打印不推送
+  python3 push_token.py                     循环获取并推送 (1~3分钟随机间隔)
+  python3 push_token.py --once              仅执行一次
+  python3 push_token.py --once --print       仅执行一次，打印 JSON
   python3 push_token.py --list "ChatGPT,45,100;Claude,20,100"
 """
 import requests
@@ -17,9 +17,11 @@ import json
 import sys
 import os
 import time
+import random
 import argparse
 import base64
 from pathlib import Path
+from datetime import datetime
 
 CODEX_AUTH_FILE = os.path.expanduser("~/.codex/auth.json")
 AG_DIR = os.path.expanduser("~/.antigravity_cockpit")
@@ -403,14 +405,48 @@ def push_to_esp32(host, services):
         return False
 
 
+def run_loop(host, once=False, print_only=False):
+    """主循环：周期性获取数据并推送到 ESP32"""
+    consecutive_failures = 0
+    while True:
+        now = datetime.now().strftime("%H:%M:%S")
+        print(f"\n{'─' * 40}")
+        print(f"[{now}] 获取用量...")
+        
+        services = fetch_all()
+        if not services:
+            consecutive_failures += 1
+            if consecutive_failures >= 5:
+                print(f"[{now}] ⚠ 连续 {consecutive_failures} 次获取失败")
+            wait = min(60 + consecutive_failures * 30, 300)
+            print(f"[{now}] 等待 {wait}s 后重试...")
+            time.sleep(wait)
+            continue
+        
+        consecutive_failures = 0
+        
+        if print_only:
+            print(json.dumps({"services": services}, indent=2))
+        else:
+            push_to_esp32(host, services)
+        
+        if once:
+            break
+        
+        interval = random.randint(60, 180)
+        next_time = datetime.now().strftime("%H:%M:%S")
+        print(f"\n[{next_time}] 下次刷新: {interval}s ({interval // 60}m{interval % 60:02d}s)")
+        time.sleep(interval)
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="获取 AI 服务用量并推送到 ESP32 天气时钟",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""示例:
-  python3 push_token.py --fetch                    自动获取并推送
-  python3 push_token.py --fetch --print            仅打印不推送
-  python3 push_token.py --fetch --interval 300     每5分钟自动刷新
+  python3 push_token.py                     循环获取并推送 (1~3分钟随机间隔)
+  python3 push_token.py --once              仅执行一次
+  python3 push_token.py --once --print       仅执行一次，打印 JSON
   python3 push_token.py --list "ChatGPT,45,100;Claude,20,100"
         """,
     )
@@ -418,17 +454,18 @@ def main():
     parser.add_argument("-f", "--file", help="JSON 文件路径")
     parser.add_argument("--inline", help="内联 JSON 字符串")
     parser.add_argument("--list", help="逗号分隔: name,used,limit;name,used,limit;...")
-    parser.add_argument("--fetch", action="store_true", help="自动从本地配置文件获取用量")
-    parser.add_argument("--interval", type=int, default=0, help="每 N 秒执行一次 (0=仅一次)")
+    parser.add_argument("--fetch", action="store_true", help="自动从本地配置文件获取用量 (默认行为)")
+    parser.add_argument("--once", action="store_true", help="仅执行一次 (默认循环)")
     parser.add_argument("--print", action="store_true", help="仅打印 JSON, 不推送")
     args = parser.parse_args()
 
-    def build_payload():
+    # --list / --file / --inline 模式: 单次执行
+    if args.file or args.inline or args.list:
         if args.file:
             with open(args.file) as f:
-                return json.load(f)
+                payload = json.load(f)
         elif args.inline:
-            return json.loads(args.inline)
+            payload = json.loads(args.inline)
         elif args.list:
             services = []
             for item in args.list.strip(";").split(";"):
@@ -439,32 +476,16 @@ def main():
                         "used": int(parts[1].strip()),
                         "limit": int(parts[2].strip()),
                     })
-            return {"services": services}
-        elif args.fetch:
-            svcs = fetch_all()
-            return {"services": svcs}
+            payload = {"services": services}
+        
+        if args.print:
+            print(json.dumps(payload, indent=2))
         else:
-            parser.print_help()
-            sys.exit(1)
-
-    payload = build_payload()
-
-    if args.print:
-        print(json.dumps(payload, indent=2))
+            push_to_esp32(args.host, payload["services"])
         return
 
-    if args.interval > 0:
-        print(f"运行间隔: {args.interval}s, Ctrl+C 停止")
-        first = True
-        while True:
-            if not first and args.fetch:
-                payload["services"] = fetch_all()
-            first = False
-            push_to_esp32(args.host, payload["services"])
-            print(f"── 等待 {args.interval}s ──\n")
-            time.sleep(args.interval)
-    else:
-        push_to_esp32(args.host, payload["services"])
+    # 默认: 循环获取并推送
+    run_loop(host=args.host, once=args.once, print_only=args.print)
 
 
 if __name__ == "__main__":
