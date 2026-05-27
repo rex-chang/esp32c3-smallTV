@@ -17,3 +17,6 @@ __pycache__/
 .pytest_cache/
 .venv/
 venv/
+
+# 忽略 Claude Code 配置目录
+.claude/
